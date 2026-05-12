@@ -1,0 +1,32 @@
+# 编译产物
+bin/
+obj/
+*.exe
+*.dll
+*.pdb
+
+# Visual Studio / Rider
+.vs/
+.idea/
+*.user
+*.suo
+*.userprefs
+*.cache
+
+# 运行时
+logs/
+*.log
+
+# NuGet
+packages/
+*.nupkg
+project.lock.json
+project.assets.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 配置：本地密码不入仓
+appsettings.Local.json
+appsettings.Production.json
