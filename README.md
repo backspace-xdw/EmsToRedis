@@ -59,19 +59,58 @@ dotnet build -c Release
 
 ---
 
-## 3. 你需要做的事
+## 3. 数据源接入说明
 
-**只改 `Acquisition/VehicleAcquirer.cs` 一个文件**，把你已有的"从 9902 RTDB 读取车辆"的代码粘贴进去，逐字段映射到 `VehicleSnapshot`，返回 `IList<VehicleSnapshot>`。
+`VehicleAcquirer.ReadAllAsync` 已按既有 EMS 采集程序的"基址 + emsid 递增"模式实现，直接复用 `Emsplusapi`（P/Invoke `C:\Windows\System32\EosDapi.dll`）。
 
-模板见 `VehicleAcquirer.cs` 内的注释。
+### 3.1 车辆列表
+`DeviceToEmspoint.ini`（与 `EmsToRedis.exe` 同目录，编码 GB2312/GBK），每行一辆车 2 列：
 
-不需要管：
-- diff 检测、Redis 写入顺序、HSET 原子性 → `RedisWriter` 已封装
-- 心跳 → `HeartbeatWorker` 后台自动跑
-- 车辆增删（SADD/SREM `vehicles:active`）→ `SyncWorker` 自动维护
-- `schema:version` 写入 → 启动时自动
-- `updatedAt` 时间戳 → 写入前自动填
-- 冷启动全量重写 → 第一轮自动走全量分支
+```ini
+Emspoint,DeviceID
+Device001,4G2501080001
+Device002,4G2501080002
+```
+
+**Redis HSET 字段**（精简到 8 项，协议中 `vin / plateNumber / rtError` 在本环境不启用）：
+
+| 字段 | 来源 |
+| --- | --- |
+| `deviceId` | ini 第 2 列 |
+| `lng` / `lat` / `altitude` | `_Location` 基址 +1/+2/+3 |
+| `locationStatus` | `GetPointPdstate("_Location")` ⇒ "1"/"0" |
+| `isAlarm` | SyncWorker 派生：任一灭火器 `isAlarm=true` 即整车告警 |
+| `fireExtinguishers` | 16 个灭火器 JSON 数组，每个 `isAlarm` 由 `AlarmRule` 算 |
+| `updatedAt` | 写入 Redis 的时刻（unix ms） |
+
+**单车采集失败**：Acquirer 标记内部 `RtError=true`，SyncWorker 跳过本轮 upsert，**保留 Redis 上轮数据**（不写零值覆盖好数据，也不把该车从 active 移除）。
+
+### 3.2 测点命名约定
+| Redis 字段 | 来源 |
+| --- | --- |
+| `locationStatus` | `GetPointPdstate("{Emspoint}_Location")` → 1/0 |
+| `lng` | `GetIDAiValue(GetAiID("{Emspoint}_Location") + 1)` |
+| `lat` | `GetIDAiValue(GetAiID("{Emspoint}_Location") + 2)` |
+| `altitude` | `GetIDAiValue(GetAiID("{Emspoint}_Location") + 3)` |
+| 灭火器 `i` × 6 字段 | `GetAiID("{Emspoint}_Number_{i}_Start") + 0..5` 顺序读 |
+
+每辆车固定 16 个灭火器，6 个字段：startType / warningLevel / status / command / customFaultCode / fireAlarmLevel。
+
+### 3.3 EosDapi.dll
+`Acquisition/Emsplusapi.cs` 与既有 `GetFileToEmsplus.EmsApi` 对齐：
+- 路径 `C:\Windows\SysWOW64\EosDapi.dll`（x86 进程在 64 位 Windows 上的标准位置）
+- `GetAxIDVS(srvNo, tagName)` —— 取 AI 测点 ID
+- `GetAxVS(axId, ref value, ref status)` —— 读 AI 值 + 状态
+- `GetPointPdstate(tag)` —— **C# 包装**：调 `GetAxVS`，检查 `status` 第 3 位（`1<<3` 为坏点/超时位）
+
+若 EosDapi.dll 导出名或路径不同，**只改 `Emsplusapi.cs` 一个文件**，上层 `VehicleAcquirer` 不必动。
+
+### 3.4 SyncWorker 接手以下事项
+- diff 检测、Redis 写入顺序、HSET 原子性 → `RedisWriter`
+- 心跳 → `HeartbeatWorker`
+- 车辆增删（SADD/SREM `vehicles:active`）→ `SyncWorker`
+- `schema:version`、`updatedAt`、冷启动全量重写 → 自动
+- 整车 `IsAlarm` 派生（任一灭火器告警即整车告警）→ `SyncWorker`
 
 ---
 
@@ -94,8 +133,21 @@ dotnet build -c Release
 ```
 
 - `password=` 改为运维给你的实际密码
-- `PollIntervalMs` 建议保持 1000（协议 §8.2）
 - `HeartbeatIntervalMs / HeartbeatTtlSeconds` 必须满足 `Ttl > Interval × 3`，避免抖动误判
+
+#### `PollIntervalMs` 按车数选档
+
+| 车辆规模 | 推荐 `PollIntervalMs` | 单轮预估耗时 | 备注 |
+| --- | --- | --- | --- |
+| ≤ 200 车 | 1000 | < 50 ms | 协议 §8.2 推荐值 |
+| ≤ 1300 车 | 1000 ~ 2000 | ~ 300 ms | 默认配置覆盖（GetAxVM 批量读） |
+| ≥ 3000 车 | 2000 ~ 3000 | ~ 700 ms | 需考虑分片或并行采集 |
+
+下限 100 ms（`AdapterConfig.Validate` 强制）。运行时观察 SyncWorker 输出：
+```
+cycle: 车 1300 | 读 234ms 计 28ms 写 31ms | upsert 8 ...
+```
+若 `(读+计+写) > PollIntervalMs` 持续出现 `WARN 本轮耗时 N ms 超过周期`，把 `PollIntervalMs` 上调即可，**不需要改代码**。
 
 ---
 
@@ -188,8 +240,9 @@ nssm start EmsToRedis
 
 | 项 | 来源 | 状态 |
 |---|---|---|
-| AlarmRule.IsExtinguisherAlarm 真实逻辑 | EAP 团队给 C# 源码 | 占位中（返回 false） |
-| VehicleAcquirer.ReadAllAsync 真实实现 | 你这边粘贴 9902 读取代码 | 占位中（抛 NotImplementedException） |
+| AlarmRule.IsExtinguisherAlarm | EAP 给口径 | ✅ 已落地：`startType ∈ [2..7] ∪ {255}` / `warningLevel ∈ [1..4]` / `status ∈ [1..3]` / `customFaultCode ∈ {1,2}` / `fireAlarmLevel > 0` 任一命中即告警 |
+| EosDapi.dll 路径与导出名 | 现场机器 | 已对齐 `GetFileToEmsplus.EmsApi`：`SysWOW64\EosDapi.dll`，导出 `GetAxIDVS / GetAxVS` |
+| `vin / plateNumber / rtError` 字段 | 现场决定 | ✅ 不写 HSET（DeviceID 为唯一码；RtError 仅作内部跳过 upsert 的开关） |
 
 ---
 

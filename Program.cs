@@ -2,6 +2,7 @@ using System;
 using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
+using EmsToRedis.Acquisition;
 using EmsToRedis.Configuration;
 using EmsToRedis.Redis;
 using EmsToRedis.Workers;
@@ -55,6 +56,23 @@ namespace EmsToRedis
                 config.Adapter.PollIntervalMs,
                 config.Adapter.HeartbeatIntervalMs,
                 config.Adapter.HeartbeatTtlSeconds);
+
+            // 1.5 加载车辆列表（DeviceToEmspoint.ini）+ 预热 EMS ID 缓存
+            //     1300 车 × 17 tag = 22100 个 GetAxIDVS 一次性查回，避免拖慢第一轮
+            var vehicles = VehicleListLoader.Load();
+            VehicleAcquirer.SetVehicleList(vehicles);
+            Log.Info("车辆列表已注入 VehicleAcquirer：{0} 辆", VehicleAcquirer.VehicleCount);
+            try
+            {
+                var prewarmSw = System.Diagnostics.Stopwatch.StartNew();
+                VehicleAcquirer.PrewarmIds();
+                prewarmSw.Stop();
+                Log.Info("ID 缓存预热耗时 {0} ms", prewarmSw.ElapsedMilliseconds);
+            }
+            catch (Exception ex)
+            {
+                Log.Warn(ex, "ID 缓存预热失败（不阻断启动，首轮采集会按需查 ID）");
+            }
 
             // 2. 连接 Redis（同步阻塞，直到连上或抛错）
             ConnectionMultiplexer mux;

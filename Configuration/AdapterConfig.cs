@@ -39,6 +39,14 @@ namespace EmsToRedis.Configuration
                 throw new InvalidOperationException("Adapter.HeartbeatIntervalMs 不能小于 500");
             if (Adapter.HeartbeatTtlSeconds < 5)
                 throw new InvalidOperationException("Adapter.HeartbeatTtlSeconds 不能小于 5");
+
+            // 协议 §6：TTL > 心跳间隔 × 3，避免单次写失败 / 网络抖动误判
+            int hbIntervalSec = Adapter.HeartbeatIntervalMs / 1000;
+            if (Adapter.HeartbeatTtlSeconds <= hbIntervalSec * 3)
+            {
+                throw new InvalidOperationException(
+                    $"Adapter.HeartbeatTtlSeconds ({Adapter.HeartbeatTtlSeconds}s) 必须 > HeartbeatIntervalMs ({Adapter.HeartbeatIntervalMs}ms) × 3");
+            }
         }
     }
 
@@ -50,7 +58,18 @@ namespace EmsToRedis.Configuration
     public class AdapterSection
     {
         public string SchemaVersion { get; set; } = "1";
+
+        /// <summary>
+        /// 主循环采集周期（毫秒）。下限 100ms（Validate 强制），上限自行衡量。
+        /// 经验值：
+        ///   ≤ 200 车  → 1000ms
+        ///   ≤ 1300 车 → 1000~2000ms（GetAxVM 批量读后单轮约 300ms）
+        ///   ≥ 3000 车 → 2000~3000ms 并考虑分片或并行
+        /// 现场看 SyncWorker 输出的 "cycle: 读 X ms 计 Y ms 写 Z ms"
+        /// 若 (X+Y+Z) 持续 > 当前 PollIntervalMs 会触发 WARN，需上调该值。
+        /// </summary>
         public int PollIntervalMs { get; set; } = 1000;
+
         public int HeartbeatIntervalMs { get; set; } = 3000;
         public int HeartbeatTtlSeconds { get; set; } = 10;
         public int VehicleOfflineTimeoutSeconds { get; set; } = 30;

@@ -1,93 +1,166 @@
+using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Threading;
 using System.Threading.Tasks;
 using EmsToRedis.Models;
+using NLog;
 
 namespace EmsToRedis.Acquisition
 {
     /// <summary>
-    /// ╔══════════════════════════════════════════════════════════════════╗
-    /// ║   ★★★  你只需要改这个文件  ★★★                                  ║
-    /// ╚══════════════════════════════════════════════════════════════════╝
+    /// 按既有 EMS 数据采集模式（"基址 + 连续偏移"）读取每辆车的实时数据，
+    /// 映射到 VehicleSnapshot，交给 SyncWorker 写入 Redis。
     ///
-    /// 把你已有的"从 9902 RTDB 读取车辆数据"代码粘贴到 ReadAllAsync 方法里，
-    /// 然后逐一映射到 VehicleSnapshot 对象、返回一个 List。
+    /// 高吞吐：使用 GetAxVM 一次批量读 N 个连续 AI，单车 P/Invoke 次数：
+    ///   1 次 PdState + 1 次 GetAxVM(n=3, Location) + 16 次 GetAxVM(n=6, Box) = 18 次
+    /// （相比单点读的 100 次，5.5× 提速；1300 车单线程 ~300ms 完成一轮）
     ///
-    /// 其余的事情（diff 检测、Redis 写入、心跳、车辆增删感知、错误处理）
-    /// 都由 SyncWorker / HeartbeatWorker / RedisWriter 自动完成。
+    /// 字段对照：
+    ///   Location 块（4 字段）：
+    ///     locationStatus = GetPointPdstate("{Emspoint}_Location") → "1"/"0"
+    ///     baseLoc = GetAiID("{Emspoint}_Location")
+    ///     [lng, lat, altitude] = GetAxVM(baseLoc + 1, n=3)
+    ///   灭火器块（i ∈ [0,16)，每个 6 字段）：
+    ///     baseBox = GetAiID("{Emspoint}_Number_{i}_Start")
+    ///     [startType, warningLevel, status, command, customFault, fireAlarmLevel]
+    ///         = GetAxVM(baseBox, n=6)
     ///
-    /// ────────────────────────────────────────────────────────────────────
-    /// 实现注意：
-    /// ────────────────────────────────────────────────────────────────────
-    ///   1. 本方法每秒被主循环调用一次（间隔由 appsettings.json 的
-    ///      Adapter.PollIntervalMs 控制）。返回应当快速（秒级以内），
-    ///      避免阻塞主循环。
-    ///
-    ///   2. 单车读失败 ≠ 全局失败：
-    ///        - 单车读失败 → 把该车 VehicleSnapshot.RtError = true，
-    ///          其他字段保留上次的最近值（或填 "0"），照常加入返回列表；
-    ///        - 全局读失败（RTDB 整个连不上）→ 直接 throw 异常，
-    ///          SyncWorker 会捕获并跳过本轮 + HeartbeatWorker 自动停发心跳，
-    ///          让 EAP 通过心跳超期察觉。
-    ///
-    ///   3. UpdatedAtUnixMs 不需要你填——SyncWorker 在写入 Redis 前
-    ///      会统一覆盖为当前时刻。
-    ///
-    ///   4. FireExtinguisher.IsAlarm 不需要你计算——SyncWorker 会调用
-    ///      AlarmRule.IsExtinguisherAlarm 统一覆盖。
-    ///      （AlarmRule 当前是占位实现，等拿到 EAP 源码后替换）
+    /// 单车异常 → VehicleSnapshot.RtError = true（内部标志，不写 Redis），
+    /// SyncWorker 跳过本轮该车 upsert，保留 Redis 上轮数据。
+    /// 整批异常（车辆列表未加载等）→ 直接抛出，由 SyncWorker / HeartbeatWorker
+    /// 联动停发心跳，让 EAP 通过 §6 心跳超期察觉。
     /// </summary>
     public static class VehicleAcquirer
     {
+        private static readonly Logger Log = LogManager.GetCurrentClassLogger();
+
+        // 车辆列表（启动时由 Program.cs 调用 SetVehicleList 注入；线程安全：只读快照）
+        private static volatile List<IDtoNameClass> _vehicles = new List<IDtoNameClass>();
+
+        public const int BoxCount = 16;
+        public const int FieldsPerBox = 6;
+        public const int LocationAiCount = 3; // baseLoc+1..+3 = lng/lat/alt
+
+        // 单线程批量读：复用缓冲，避免每车每箱分配 2 个数组
+        [ThreadStatic] private static float[] _locValues;
+        [ThreadStatic] private static int[] _locStatuses;
+        [ThreadStatic] private static float[] _boxValues;
+        [ThreadStatic] private static int[] _boxStatuses;
+
+        public static void SetVehicleList(List<IDtoNameClass> vehicles)
+        {
+            _vehicles = vehicles ?? new List<IDtoNameClass>();
+        }
+
+        public static int VehicleCount => _vehicles.Count;
+
         /// <summary>
-        /// 读取当前全部车辆快照。
+        /// 启动时调用一次：把所有车辆所需 tag 的 EMS ID 全部查回缓存，
+        /// 第一轮采集即可直接走 GetAxVM 不再触发 GetAxIDVS。
+        /// 1300 车 × (1 Location + 16 Box) = 22100 个 tag。
         /// </summary>
+        public static void PrewarmIds()
+        {
+            var snapshot = _vehicles;
+            if (snapshot.Count == 0) return;
+
+            var tags = new List<string>(snapshot.Count * (1 + BoxCount));
+            foreach (var v in snapshot)
+            {
+                if (v == null || string.IsNullOrEmpty(v.Emspoint)) continue;
+                tags.Add(v.Emspoint + "_Location");
+                for (int i = 0; i < BoxCount; i++)
+                    tags.Add(v.Emspoint + "_Number_" + i + "_Start");
+            }
+            Emsplusapi.PrewarmIds(tags);
+            Log.Info("ID 缓存预热完成：{0} 个 tag → {1} 项在缓存", tags.Count, Emsplusapi.CachedIdCount);
+        }
+
         public static Task<IList<VehicleSnapshot>> ReadAllAsync(CancellationToken ct)
         {
-            // ════════════════════════════════════════════════════════════
-            //  TODO: 把你的车辆数据读取代码粘贴到这里
-            // ════════════════════════════════════════════════════════════
-            //
-            //  填充模板示例（删掉本段后照葫芦画瓢）：
-            //
-            //      var result = new List<VehicleSnapshot>();
-            //      var rawList = MyExisting9902Reader.ReadAll();   // ← 你的读取
-            //
-            //      foreach (var raw in rawList)
-            //      {
-            //          var v = new VehicleSnapshot
-            //          {
-            //              DeviceId = raw.DeviceId,
-            //              Vin = raw.Vin,
-            //              PlateNumber = raw.PlateNumber,
-            //              Lng = raw.Longitude.ToString("F6"),
-            //              Lat = raw.Latitude.ToString("F6"),
-            //              Altitude = raw.Altitude.ToString(),
-            //              LocationStatus = raw.LocationStatus,
-            //              IsAlarm = raw.OverallAlarm,
-            //              RtError = false,
-            //              FireExtinguishers = raw.Boxes.Select(b => new FireExtinguisher
-            //              {
-            //                  BoxNumber = b.Index.ToString(),
-            //                  StartType = b.Start,
-            //                  WarningLevel = b.Fault,
-            //                  Status = b.State,
-            //                  Command = b.Cmd,
-            //                  CustomFaultCode = b.CusFault,
-            //                  FireAlarmLevel = b.FireAlarmLevel
-            //                  // IsAlarm 不用填,SyncWorker 会统一计算
-            //              }).ToList()
-            //          };
-            //          result.Add(v);
-            //      }
-            //
-            //      return Task.FromResult<IList<VehicleSnapshot>>(result);
-            //
-            // ════════════════════════════════════════════════════════════
+            var snapshot = _vehicles;
+            var result = new List<VehicleSnapshot>(snapshot.Count);
 
-            // 当前未实现，启动后第一轮就会抛异常，提醒填代码
-            throw new System.NotImplementedException(
-                "请在 EmsToRedis/Acquisition/VehicleAcquirer.cs 中实现 ReadAllAsync");
+            // 复用本线程缓冲（首次调用时分配，之后零分配）
+            if (_locValues == null) { _locValues = new float[LocationAiCount]; _locStatuses = new int[LocationAiCount]; }
+            if (_boxValues == null) { _boxValues = new float[FieldsPerBox]; _boxStatuses = new int[FieldsPerBox]; }
+
+            for (int k = 0; k < snapshot.Count; k++)
+            {
+                if (ct.IsCancellationRequested) break;
+
+                var v = snapshot[k];
+                if (v == null || string.IsNullOrEmpty(v.Emspoint) || string.IsNullOrEmpty(v.DeviceID))
+                    continue;
+
+                VehicleSnapshot vs;
+                try
+                {
+                    vs = ReadOne(v);
+                }
+                catch (Exception ex)
+                {
+                    Log.Warn(ex, "读取单车失败 deviceId={0} emspoint={1}", v.DeviceID, v.Emspoint);
+                    vs = new VehicleSnapshot
+                    {
+                        DeviceId = v.DeviceID,
+                        RtError = true,
+                    };
+                }
+                result.Add(vs);
+            }
+
+            return Task.FromResult<IList<VehicleSnapshot>>(result);
+        }
+
+        private static VehicleSnapshot ReadOne(IDtoNameClass v)
+        {
+            // —— Location 块（1 次 PdState + 1 次 GetAxVM(n=3)）——
+            int baseLoc = Emsplusapi.GetAiID(v.Emspoint + "_Location");
+            bool locOk = Emsplusapi.GetPointPdstate(v.Emspoint + "_Location");
+            Emsplusapi.GetIDAiValues(baseLoc + 1, LocationAiCount, _locValues, _locStatuses);
+            float lng = _locValues[0];
+            float lat = _locValues[1];
+            float alt = _locValues[2];
+
+            // —— 灭火器块（每箱 1 次 GetAxVM(n=6)）——
+            var boxes = new List<FireExtinguisher>(BoxCount);
+            for (int i = 0; i < BoxCount; i++)
+            {
+                int baseBox = Emsplusapi.GetAiID(v.Emspoint + "_Number_" + i + "_Start");
+                Emsplusapi.GetIDAiValues(baseBox, FieldsPerBox, _boxValues, _boxStatuses);
+                boxes.Add(new FireExtinguisher
+                {
+                    BoxNumber = i.ToString(CultureInfo.InvariantCulture),
+                    StartType = FloatToStr(_boxValues[0]),
+                    WarningLevel = FloatToStr(_boxValues[1]),
+                    Status = FloatToStr(_boxValues[2]),
+                    Command = FloatToStr(_boxValues[3]),
+                    CustomFaultCode = FloatToStr(_boxValues[4]),
+                    FireAlarmLevel = FloatToStr(_boxValues[5]),
+                    // IsAlarm 不在此处计算，SyncWorker 会用 AlarmRule 统一覆盖
+                });
+            }
+
+            return new VehicleSnapshot
+            {
+                DeviceId = v.DeviceID,
+                Lng = lng.ToString("F6", CultureInfo.InvariantCulture),
+                Lat = lat.ToString("F6", CultureInfo.InvariantCulture),
+                Altitude = FloatToStr(alt),
+                LocationStatus = locOk ? "1" : "0",
+                IsAlarm = false, // 整车 IsAlarm 由 SyncWorker 基于各 box.IsAlarm 派生
+                FireExtinguishers = boxes,
+            };
+        }
+
+        private static string FloatToStr(float v)
+        {
+            // 整数（含 0）输出无小数点；其余保留 6 位有效数字
+            if (Math.Abs(v - (int)v) < 1e-6f)
+                return ((int)v).ToString(CultureInfo.InvariantCulture);
+            return v.ToString("G6", CultureInfo.InvariantCulture);
         }
     }
 }

@@ -43,26 +43,7 @@ namespace EmsToRedis.Redis
         {
             if (v == null || string.IsNullOrEmpty(v.DeviceId))
                 throw new ArgumentException("VehicleSnapshot.DeviceId 不能为空", nameof(v));
-
-            var fireExtJson = JsonConvert.SerializeObject(
-                v.FireExtinguishers ?? new List<FireExtinguisher>());
-
-            var entries = new HashEntry[]
-            {
-                new HashEntry("deviceId", v.DeviceId),
-                new HashEntry("vin", v.Vin ?? ""),
-                new HashEntry("plateNumber", v.PlateNumber ?? ""),
-                new HashEntry("lng", v.Lng ?? "0"),
-                new HashEntry("lat", v.Lat ?? "0"),
-                new HashEntry("altitude", v.Altitude ?? "0"),
-                new HashEntry("locationStatus", v.LocationStatus ?? "0"),
-                new HashEntry("isAlarm", v.IsAlarm ? "1" : "0"),
-                new HashEntry("rtError", v.RtError ? "1" : "0"),
-                new HashEntry("fireExtinguishers", fireExtJson),
-                new HashEntry("updatedAt", v.UpdatedAtUnixMs.ToString())
-            };
-
-            return _db.HashSetAsync(VfsmpKeys.Vehicle(v.DeviceId), entries);
+            return _db.HashSetAsync(VfsmpKeys.Vehicle(v.DeviceId), BuildHashEntries(v));
         }
 
         /// <summary>
@@ -99,6 +80,67 @@ namespace EmsToRedis.Redis
         }
 
         /// <summary>
+        /// 批量写入：一次 IBatch 把所有 upsert/active/remove 命令 pipeline 出去。
+        /// 协议 §7 顺序要求：
+        ///   * 单车 upsert：先 HSET vehicle，再 SADD active —— 在 IBatch 内按此顺序入队
+        ///   * 单车 remove：先 SREM active，再 DEL vehicle —— 同上
+        /// 跨车顺序无约束。返回前 await 所有命令的 Task。
+        /// </summary>
+        /// <param name="upserts">本轮需要写入的车辆快照</param>
+        /// <param name="newActives">本轮新加入 active 集合的 deviceId（旧的不必重复 SADD）</param>
+        /// <param name="removes">本轮要清掉的 deviceId</param>
+        public async Task ApplyBatchAsync(
+            IList<VehicleSnapshot> upserts,
+            IList<string> newActives,
+            IList<string> removes)
+        {
+            if ((upserts == null || upserts.Count == 0)
+                && (newActives == null || newActives.Count == 0)
+                && (removes == null || removes.Count == 0))
+            {
+                return;
+            }
+
+            var batch = _db.CreateBatch();
+            var pending = new List<Task>(
+                (upserts?.Count ?? 0) + (newActives?.Count ?? 0) + ((removes?.Count ?? 0) * 2));
+
+            // 先 remove（先 SREM 再 DEL，单车顺序敏感）
+            if (removes != null)
+            {
+                foreach (var id in removes)
+                {
+                    if (string.IsNullOrEmpty(id)) continue;
+                    pending.Add(batch.SetRemoveAsync(VfsmpKeys.VehiclesActive, id));
+                    pending.Add(batch.KeyDeleteAsync(VfsmpKeys.Vehicle(id)));
+                }
+            }
+
+            // 再 upsert：HSET 先入队（保证 §7 单车顺序）
+            if (upserts != null)
+            {
+                foreach (var v in upserts)
+                {
+                    if (v == null || string.IsNullOrEmpty(v.DeviceId)) continue;
+                    pending.Add(batch.HashSetAsync(VfsmpKeys.Vehicle(v.DeviceId), BuildHashEntries(v)));
+                }
+            }
+
+            // 后 SADD active（新出现的车）
+            if (newActives != null)
+            {
+                foreach (var id in newActives)
+                {
+                    if (string.IsNullOrEmpty(id)) continue;
+                    pending.Add(batch.SetAddAsync(VfsmpKeys.VehiclesActive, id));
+                }
+            }
+
+            batch.Execute();
+            await Task.WhenAll(pending).ConfigureAwait(false);
+        }
+
+        /// <summary>
         /// 心跳：SET vfsmp:adapter:heartbeat unixMs EX ttlSeconds。
         /// </summary>
         public Task WriteHeartbeatAsync(long unixMs, int ttlSeconds)
@@ -106,6 +148,23 @@ namespace EmsToRedis.Redis
             return _db.StringSetAsync(VfsmpKeys.Heartbeat,
                 unixMs.ToString(),
                 TimeSpan.FromSeconds(ttlSeconds));
+        }
+
+        private static HashEntry[] BuildHashEntries(VehicleSnapshot v)
+        {
+            var fireExtJson = JsonConvert.SerializeObject(
+                v.FireExtinguishers ?? new List<FireExtinguisher>());
+            return new HashEntry[]
+            {
+                new HashEntry("deviceId", v.DeviceId),
+                new HashEntry("lng", v.Lng ?? "0"),
+                new HashEntry("lat", v.Lat ?? "0"),
+                new HashEntry("altitude", v.Altitude ?? "0"),
+                new HashEntry("locationStatus", v.LocationStatus ?? "0"),
+                new HashEntry("isAlarm", v.IsAlarm ? "1" : "0"),
+                new HashEntry("fireExtinguishers", fireExtJson),
+                new HashEntry("updatedAt", v.UpdatedAtUnixMs.ToString())
+            };
         }
     }
 }
