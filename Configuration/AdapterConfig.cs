@@ -42,10 +42,14 @@ namespace EmsToRedis.Configuration
 
             // 协议 §6：TTL > 心跳间隔 × 3，避免单次写失败 / 网络抖动误判
             int hbIntervalSec = Adapter.HeartbeatIntervalMs / 1000;
-            if (Adapter.HeartbeatTtlSeconds <= hbIntervalSec * 3)
+            int minTtl = hbIntervalSec * 3 + 1;
+            if (Adapter.HeartbeatTtlSeconds < minTtl)
             {
                 throw new InvalidOperationException(
-                    $"Adapter.HeartbeatTtlSeconds ({Adapter.HeartbeatTtlSeconds}s) 必须 > HeartbeatIntervalMs ({Adapter.HeartbeatIntervalMs}ms) × 3");
+                    $"Adapter.HeartbeatTtlSeconds 必须 ≥ {minTtl}s。"
+                    + $"当前 {Adapter.HeartbeatTtlSeconds}s / HeartbeatIntervalMs={Adapter.HeartbeatIntervalMs}ms。"
+                    + $"修复：把 HeartbeatTtlSeconds 改为 ≥ {minTtl}（推荐 {Math.Max(minTtl + 4, 10)}），"
+                    + $"或把 HeartbeatIntervalMs 降到 ≤ {(Adapter.HeartbeatTtlSeconds - 1) / 3 * 1000}ms");
             }
         }
     }
