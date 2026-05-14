@@ -15,5 +15,11 @@ namespace EmsToRedis.Logic
         {
             return (long)(DateTime.UtcNow - UnixEpoch).TotalMilliseconds;
         }
+
+        /// <summary>Unix ms → 本地时间（日志展示用）。</summary>
+        public static DateTime FromUnixMsLocal(long unixMs)
+        {
+            return UnixEpoch.AddMilliseconds(unixMs).ToLocalTime();
+        }
     }
 }

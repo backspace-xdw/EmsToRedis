@@ -202,6 +202,7 @@ namespace EmsToRedis.Workers
 
             var upserts = new List<VehicleSnapshot>();
             var newActives = new List<string>();
+            var timestampOnly = new List<VehicleSnapshot>();
             foreach (var v in current)
             {
                 if (v == null || string.IsNullOrEmpty(v.DeviceId)) continue;
@@ -211,20 +212,25 @@ namespace EmsToRedis.Workers
                     upserts.Add(v);
                     if (!_activeIds.Contains(v.DeviceId)) newActives.Add(v.DeviceId);
                 }
+                else if (_activeIds.Contains(v.DeviceId))
+                {
+                    // 字段没变但车还在线：只刷 updatedAt，告诉 EAP 数据仍是最新的
+                    timestampOnly.Add(v);
+                }
             }
 
             swCompute.Stop();
             long computeMs = swCompute.ElapsedMilliseconds;
 
-            if (removes.Count == 0 && upserts.Count == 0)
+            if (removes.Count == 0 && upserts.Count == 0 && timestampOnly.Count == 0)
             {
-                LogCycle(readMs, computeMs, 0, current.Count, 0, 0, 0, rtErrorCount);
+                LogCycle(readMs, computeMs, 0, current.Count, 0, 0, 0, 0, rtErrorCount, nowMs);
                 return;
             }
 
             // 6. 一次 IBatch 全部下发
             var swRedis = Stopwatch.StartNew();
-            await _writer.ApplyBatchAsync(upserts, newActives, removes).ConfigureAwait(false);
+            await _writer.ApplyBatchAsync(upserts, newActives, removes, timestampOnly).ConfigureAwait(false);
             swRedis.Stop();
 
             // 7. 写入成功后更新本地状态
@@ -243,19 +249,26 @@ namespace EmsToRedis.Workers
             }
 
             LogCycle(readMs, computeMs, swRedis.ElapsedMilliseconds,
-                current.Count, upserts.Count, newActives.Count, removes.Count, rtErrorCount);
+                current.Count, upserts.Count, newActives.Count, removes.Count, timestampOnly.Count,
+                rtErrorCount, nowMs);
         }
 
         /// <summary>
         /// 一轮统一日志：默认 DEBUG（无写入或量小时），有移除/告警异常时升 INFO。
         /// 大批量（1300 车）部署的运维核心可观测点。
+        /// updatedAt 列展示本轮写入 Redis 的时间戳（HH:mm:ss.fff + epoch ms），
+        /// 用于在没有真实数据变化时也能直观确认时间在走、tsOnly 在生效。
         /// </summary>
         private static void LogCycle(long readMs, long computeMs, long redisMs,
-            int totalCars, int upserts, int newActives, int removes, int rtErrors)
+            int totalCars, int upserts, int newActives, int removes, int tsOnly, int rtErrors,
+            long updatedAtMs)
         {
+            var dt = TimeHelper.FromUnixMsLocal(updatedAtMs);
             string line = string.Format(
-                "cycle: 车 {0} | 读 {1}ms 计 {2}ms 写 {3}ms | upsert {4} (新 {5}) remove {6} rtError {7}",
-                totalCars, readMs, computeMs, redisMs, upserts, newActives, removes, rtErrors);
+                "cycle: 车 {0} | 读 {1}ms 计 {2}ms 写 {3}ms | upsert {4} (新 {5}) ts {6} remove {7} rtError {8} | updatedAt {9:HH:mm:ss.fff} ({10})",
+                totalCars, readMs, computeMs, redisMs,
+                upserts, newActives, tsOnly, removes, rtErrors,
+                dt, updatedAtMs);
             if (removes > 0 || rtErrors > 0) Log.Info(line);
             else Log.Debug(line);
         }

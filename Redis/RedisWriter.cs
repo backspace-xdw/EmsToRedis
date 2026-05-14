@@ -86,24 +86,31 @@ namespace EmsToRedis.Redis
         ///   * 单车 remove：先 SREM active，再 DEL vehicle —— 同上
         /// 跨车顺序无约束。返回前 await 所有命令的 Task。
         /// </summary>
-        /// <param name="upserts">本轮需要写入的车辆快照</param>
+        /// <param name="upserts">本轮需要写入的车辆快照（字段有变化，整车全字段 HSET）</param>
         /// <param name="newActives">本轮新加入 active 集合的 deviceId（旧的不必重复 SADD）</param>
         /// <param name="removes">本轮要清掉的 deviceId</param>
+        /// <param name="timestampOnly">
+        /// 字段未变化但仍在线的车辆，只刷新 updatedAt 单字段。
+        /// 让 EAP 通过 updatedAt 区分"数据没变但活着"和"采集挂了"。
+        /// </param>
         public async Task ApplyBatchAsync(
             IList<VehicleSnapshot> upserts,
             IList<string> newActives,
-            IList<string> removes)
+            IList<string> removes,
+            IList<VehicleSnapshot> timestampOnly = null)
         {
             if ((upserts == null || upserts.Count == 0)
                 && (newActives == null || newActives.Count == 0)
-                && (removes == null || removes.Count == 0))
+                && (removes == null || removes.Count == 0)
+                && (timestampOnly == null || timestampOnly.Count == 0))
             {
                 return;
             }
 
             var batch = _db.CreateBatch();
             var pending = new List<Task>(
-                (upserts?.Count ?? 0) + (newActives?.Count ?? 0) + ((removes?.Count ?? 0) * 2));
+                (upserts?.Count ?? 0) + (newActives?.Count ?? 0)
+                + ((removes?.Count ?? 0) * 2) + (timestampOnly?.Count ?? 0));
 
             // 先 remove（先 SREM 再 DEL，单车顺序敏感）
             if (removes != null)
@@ -123,6 +130,19 @@ namespace EmsToRedis.Redis
                 {
                     if (v == null || string.IsNullOrEmpty(v.DeviceId)) continue;
                     pending.Add(batch.HashSetAsync(VfsmpKeys.Vehicle(v.DeviceId), BuildHashEntries(v)));
+                }
+            }
+
+            // 仅刷 updatedAt（字段未变但车还在线）
+            if (timestampOnly != null)
+            {
+                foreach (var v in timestampOnly)
+                {
+                    if (v == null || string.IsNullOrEmpty(v.DeviceId)) continue;
+                    pending.Add(batch.HashSetAsync(
+                        VfsmpKeys.Vehicle(v.DeviceId),
+                        "updatedAt",
+                        v.UpdatedAtUnixMs.ToString()));
                 }
             }
 
