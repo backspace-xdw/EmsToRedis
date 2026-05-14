@@ -1,8 +1,8 @@
 # EmsToRedis Redis 数据结构说明（订阅方阅读）
 
-> 适用版本：EmsToRedis v1.0 / VFSMP Redis 共享层协议 v1
+> 适用版本：EmsToRedis v1.1 / VFSMP Redis 共享层协议 v1
 > 适用对象：从 Redis 读取车辆数据的第三方（EAP / 平台 / 大屏）
-> 写入方（本程序）每秒一轮全量采集，仅在字段变化时写入 Redis；详见 §6。
+> 写入方（本程序）每秒一轮全量采集，**`updatedAt` 每轮都刷新**，其余字段仅在变化时整体 HSET。详见 §6。
 
 ---
 
@@ -12,7 +12,7 @@
 | --- | --- | --- | --- | --- |
 | `vfsmp:schema:version` | STRING | 启动时 1 次 | 否 | 协议版本号，读到 `"1"` 即本文档版本 |
 | `vfsmp:vehicles:active` | SET | 变化时增量 | 否 | 当前所有"在册"车辆的 deviceId 集合 |
-| `vfsmp:vehicle:{deviceId}` | HASH | 字段变化时刷新 | 否 | 单车实时快照，N 辆车就有 N 个 key |
+| `vfsmp:vehicle:{deviceId}` | HASH | 每轮刷 `updatedAt`；其余字段变化时刷新 | 否 | 单车实时快照，N 辆车就有 N 个 key |
 | `vfsmp:adapter:heartbeat` | STRING | 每 3s 一次 | **TTL 10s** | 适配器心跳，超期视为离线 |
 
 > Redis 命名空间统一前缀 `vfsmp:`，订阅方按需匹配。
@@ -36,7 +36,7 @@
 | `locationStatus` | string `"1"`/`"0"` | `1` | 定位是否有效：`1`=好点 / `0`=坏点超时 |
 | `isAlarm` | string `"1"`/`"0"` | `0` | 整车告警状态，16 个灭火器任一告警即 `1` |
 | `fireExtinguishers` | string (JSON) | 见 §3 | 16 个灭火器的实时数据数组 |
-| `updatedAt` | string (unix ms) | `1747120410123` | 本快照写入 Redis 时刻（毫秒） |
+| `updatedAt` | string (unix ms) | `1747120410123` | **最近一次成功采集时刻**（写 Redis 的时间），每轮刷新 |
 
 ### 2.2 完整示例
 
@@ -58,9 +58,9 @@ updatedAt       1747120410123
 ### 2.3 字段语义补充
 
 - **`lng` / `lat` = "0.000000"**：通常表示无定位（GPS 未锁星 / 设备未上传）。配合 `locationStatus="0"` 一起判断。
-- **`updatedAt`**：是**写 Redis 的时刻**，不是 GPS / 探测器原始时间戳。订阅方可用 `now - updatedAt > 阈值` 判断单车数据陈旧（建议阈值 = 写入方 `PollIntervalMs` × 3）。
+- **`updatedAt`**：写入方"最近一次成功读到这辆车数据"的时刻（毫秒）。即使其他字段没变化，只要本轮采集到了该车，就会被刷新。订阅方可直接用 `now - updatedAt > 阈值` 判断单车数据陈旧（推荐阈值 = 写入方 `PollIntervalMs` × 3，默认 3000 ms）。
 - **`isAlarm` 的派生**：写入方按 §4 规则逐箱判定，**任一箱告警即整车告警**。订阅方一般不需要重算。
-- **HSET 是原子的**：一辆车 8 个字段的写入在一条 Redis 命令内完成，订阅方读到的永远是同一轮的快照，不会出现半新半旧。
+- **HSET 原子性**：单车整体刷新时 8 个字段一次 HSET 完成；只刷 `updatedAt` 时是单字段 HSET。两种情况各自原子，订阅方读到的永远是某轮内一致的快照，不会半新半旧。
 
 ---
 
@@ -116,7 +116,7 @@ updatedAt       1747120410123
 
 **整车 `isAlarm`** = OR(16 个箱 `isAlarm`)
 
-> 写入方已经算好 `isAlarm` 字段并写入 Redis；订阅方一般直接用。如需自行复算（比如想换告警口径），请按上表实现。
+> 写入方已经算好 `isAlarm` 字段并写入 Redis；订阅方一般直接用。如需自行复算（比如想换告警口径），请按上表实现。源码：`Logic/AlarmRule.cs`。
 
 ---
 
@@ -138,21 +138,25 @@ SCARD vfsmp:vehicles:active
 ### 5.2 增删时机
 - **新车出现**（ini 增加一行 + 重启 / 热加载）→ 写入方 `SADD` 加入
 - **车辆下架**（ini 删除）→ 写入方 `SREM` 移除 + `DEL vfsmp:vehicle:{id}`
-- **单车采集失败**：**不**移除（保持 active 不变，HASH 数据保留上轮）
+- **单车采集失败**：**不**移除（保持 active 不变；HASH 数据保留上轮，`updatedAt` 停在最后一次成功的时刻）
 
 ---
 
 ## 6. 写入频率 / Diff 行为（重要）
 
-**写入方循环周期** = `PollIntervalMs`（默认 1000 ms，可配）。每轮：
-1. 读 EMS 全部车辆数据
-2. **只写发生变化的车**（FNV-1a 哈希字段值比对上一轮）
-3. 心跳每 `HeartbeatIntervalMs`（默认 3000 ms）刷新一次
+写入方循环周期 = `PollIntervalMs`（默认 1000 ms，可配）。每轮对每辆车产生 **3 类写入之一**：
+
+| 情况 | Redis 操作 | 频率 |
+| --- | --- | --- |
+| 字段发生变化（lng/lat/灭火器等任一变） | 整车 8 字段 HSET（含新 `updatedAt`） | 真有变化时触发 |
+| 字段无变化但本轮采集成功 | **单字段 HSET `updatedAt`** | 几乎每轮，每车一次 |
+| 本轮该车采集失败（`RtError`） | 不写入，HASH 保持上轮，`updatedAt` 冻结 | 异常时 |
 
 **订阅方含义**：
-- 一辆车的 `updatedAt` 可能**几秒甚至几十秒不变**（数据没变化时不重写）
-- 不要靠 `updatedAt` 判断"刚刚"采集成功；要判断"采集器活着"用 §7 心跳
-- 字段值有变化时，Redis HSET 整体被刷新；可用 Redis Keyspace Notifications 订阅 `hset` 事件接收变更通知
+
+- `updatedAt` 现在是"采集器最近一次成功读到这辆车的时刻"。判断单车存活直接看它的推进就行，不再需要靠心跳间接推断。
+- 字段值是否变化看 `updatedAt` **不够**——它每秒都在动；要靠 §9.2 的 keyspace notification、或显式比对字段值。
+- **Keyspace 通知会很密**：1300 车 + 1s 周期 ≈ 每秒 1300 个 `hset` 事件。订阅方若只关心"业务字段是否变化"，建议在收到通知后用 HGETALL 拉快照自行比对，或换用周期性轮询而非事件流。
 
 ### 启用 keyspace notification（订阅方一次性配置）
 
@@ -235,7 +239,7 @@ for r in results:
     r["fireExtinguishers"] = json.loads(r["fireExtinguishers"])
 ```
 
-### 9.2 增量订阅（实时大屏推荐）
+### 9.2 增量订阅（实时大屏）
 ```python
 # 1. CONFIG SET notify-keyspace-events Khs   （一次性）
 # 2. 订阅 hset / sadd / srem 事件
@@ -246,10 +250,23 @@ for msg in ps.listen():
     if msg["type"] == "pmessage":
         key = msg["channel"].decode().split(":", 2)[-1]
         # 收到变化通知 → HGETALL 该 key 即可拿到最新快照
+        # 注意：updatedAt 每轮都刷，事件密度 ≈ 车数 / 周期；
+        # 仅关心业务字段变化时，本地对比上一次值再决定是否处理
         ...
 ```
 
 ### 9.3 命令行验证
+
+观察 `updatedAt` 是否在持续推进（最直接的"采集器还活着"信号）：
+
+```sh
+# 每秒打一次，watch ms 列在增长
+redis-cli HGET vfsmp:vehicle:4G2501080001 updatedAt
+redis-cli HGET vfsmp:vehicle:4G2501080001 updatedAt
+redis-cli HGET vfsmp:vehicle:4G2501080001 updatedAt
+```
+
+其他常用：
 ```sh
 redis-cli SMEMBERS vfsmp:vehicles:active
 redis-cli HGETALL vfsmp:vehicle:4G2501080001
@@ -264,17 +281,29 @@ redis-cli SCARD vfsmp:vehicles:active
 
 | 场景 | Redis 表现 | 订阅方应对 |
 | --- | --- | --- |
-| 适配器进程崩溃 | `heartbeat` 10s 内过期 → `nil` | 整体显示"采集中断"，告警值保留至自然过期 |
-| 数据源全断（EosDapi 读不到） | `heartbeat` 停止刷新；车辆 HASH 不再更新 | 同上 |
-| 单车采集失败（局部） | 该车 HASH 保留上一轮数据；`updatedAt` 不变 | 检测 `now - updatedAt` 判断陈旧 |
+| 适配器进程崩溃 | `heartbeat` 10s 内过期 → `nil`；所有车 `updatedAt` 停滞 | 整体显示"采集中断" |
+| 数据源全断（EosDapi 读不到） | `heartbeat` 停止刷新；所有车 `updatedAt` 停滞 | 同上 |
+| 单车采集失败（局部） | 该车 HASH 保留上轮数据；**该车 `updatedAt` 不变**（其他车正常推进） | `now - updatedAt > PollIntervalMs × 3` 判定该车陈旧 |
 | 车辆从配置中删除 | `active` SREM + `vehicle:{id}` DEL | 收到 keyspace 通知后从 UI 移除 |
 | 新车上线 | `active` SADD + `vehicle:{id}` HSET | 收到 keyspace 通知后从 UI 加入 |
 | 网络抖动 / Redis 单次失败 | TTL 10s 给 3 次重试余量，通常不影响订阅 | 不需要特殊处理 |
 
 ---
 
-## 11. 联系
+## 11. 与上一版（v1.0）的差异
+
+> 升级要点供已经实现 v1.0 订阅方参考；新接入方可跳过本节。
+
+- **`updatedAt` 不再"按 diff 刷新"**：v1.0 中字段不变就不更新，导致正常运行也会出现"几秒~几十秒不动"，曾被误判为采集卡死。v1.1 改为每轮成功采集都刷（单字段 HSET，写入开销 ≪ 全量 HSET）。
+- **新增"陈旧判定"路径**：v1.1 起可以直接靠 `now - updatedAt` 判断单车数据新鲜度，不再需要绕道心跳。
+- **keyspace 事件密度提升**：v1.0 事件 ≈ 业务变化频率；v1.1 事件 ≈ 车数 × 轮次。仅关心业务变化的订阅方需做客户端去抖（见 §9.2 注释）。
+- **HSET 原子性范围保留**：整车刷新仍是 8 字段单条 HSET；只刷时间戳是单字段 HSET，两者各自原子，订阅方读到的不会半新半旧。
+
+---
+
+## 12. 联系
 
 写入方实现：`EmsToRedis` 项目 — `https://github.com/backspace-xdw/EmsToRedis`
 协议主文档：参见仓库 `README.md` §10 协议对照表
 告警规则源码：`Logic/AlarmRule.cs`
+diff / 时间戳逻辑：`Workers/SyncWorker.cs` + `Logic/DiffTracker.cs` + `Redis/RedisWriter.cs`
